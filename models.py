@@ -65,7 +65,6 @@ class RegressionModel(nn.Module):
         self.output = nn.Conv1d(feature_size, num_anchors * 1, kernel_size=3, padding=1)
 
     def forward(self, x):
-        print("regression forward", x.shape)
         out = self.conv1(x)
         out = self.act1(out)
 

@@ -1,12 +1,12 @@
 import torch
 import torch.nn as nn
+import math
 
 class FocalLoss(nn.Module):
-    #def __init__(self):
-
     def forward(self, classifications, regressions, annotations):
         alpha = 0.25
         gamma = 2.0
+        anchor_width = 9
         batch_size = classifications.shape[0]
         classification_losses = []
         regression_losses = []
@@ -16,14 +16,25 @@ class FocalLoss(nn.Module):
             regression = regressions[j, :, :]
 
             bline_annotation = annotations[j, :, :]
-            bline_annotation = bline_annotation[bline_annotation[:, 2] != -1] # -1은 padding value
+            #bline_annotation = bline_annotation[bline_annotation[:, 2] != -1] # -1은 padding value
             classification = torch.clamp(classification, 1e-4, 1.0 - 1e-4)
 
-            beat_lines = bline_annotation[:, :]
-            beat_timepoints = (beat_lines[:, 0] + beat_lines[:, 1])/2
-            positive_indices = torch.floor(beat_timepoints*100).long()
-            
-            anchor_beats_start = positive_indices/100
+            beat_indices = torch.nonzero(bline_annotation[0] == 1, as_tuple=False)
+            assigned_annotations = torch.cat((
+                beat_indices - math.floor(anchor_width/2),
+                beat_indices + math.floor(anchor_width/2),
+                bline_annotation[1, beat_indices] == 1,
+            ), 1).to(annotations.device)
+
+            gt_ctr_x = (assigned_annotations[:, 0] + assigned_annotations[:, 1])/2
+
+            anchor = torch.cat((
+                torch.floor(gt_ctr_x.unsqueeze(dim=1) / 10) * 10,
+                torch.ceil(gt_ctr_x.unsqueeze(dim=1) / 10 + 0.1) * 10
+            ), 1).to(gt_ctr_x.device)
+
+            anchor_widths = anchor[:, 1] - anchor[:, 0]
+            anchor_ctr_x = (anchor[:, 0] + anchor[:, 1])/2
 
             ##########################
             # compute the loss for classification
@@ -33,9 +44,11 @@ class FocalLoss(nn.Module):
             if torch.cuda.is_available():
                 targets = targets.cuda()
 
-            num_positive_anchors = len(positive_indices)
+            positive_indices = torch.zeros(classifications.size(dim=1))
+            positive_indices[anchor_ctr_x.long()] = 1
 
-            targets[positive_indices, beat_lines[:, 2].long()] = 1
+            num_positive_anchors = positive_indices.sum()
+            targets[gt_ctr_x.long(), assigned_annotations[:, 2].long()] = 1
 
             if torch.cuda.is_available():
                 alpha_factor = (torch.ones(targets.shape) * alpha).cuda()
@@ -56,27 +69,11 @@ class FocalLoss(nn.Module):
             ##########################
             # compute the loss for regression
 
-            anchor_widths_pi = 0.01 # anchor_beats_end - anchor_beats_start
-            anchor_ctr_x_pi = anchor_beats_start + 0.005 # anchor_beats_start + 0.5*anchor_widths_pi
+            gt_widths = torch.ones(regression.size(dim=1)).to(regression.device) * 10
 
-            gt_widths  = 0.01 # beat_lines[:, 1] - beat_lines[:, 0]
-            gt_ctr_x   = beat_lines[:, 0] + 0.005 # beat_lines[:, 0] + 0.5*gt_widths
-            # gt_start = beat_lines[:, 0]
-            # gt_end = beat_lines[:, 1]
+            targets_dx = ((gt_ctr_x - anchor_ctr_x) / anchor_widths).cuda()
 
-            # clip widths to 1
-            #gt_widths  = torch.clamp(gt_widths, min=0.01)
-
-            targets_dx = ((gt_ctr_x - anchor_ctr_x_pi) / anchor_widths_pi).cuda()
-            # targets_dw = torch.log(gt_widths / anchor_widths_pi)
-            # targets_distance_start = anchor_beats_start - gt_start
-            # targets_distance_end = anchor_beats_end - gt_end
-
-            # targets = torch.stack((targets_distance_start, targets_distance_end))
-            # targets = targets.t()
-
-            targets_dx = targets_dx.unsqueeze(1)
-            regression_diff = torch.abs(targets_dx - regression[positive_indices, :])
+            regression_diff = torch.abs(targets_dx.long() - regression[positive_indices.long(), :]).float()
 
             # 9.0 삭제됨. num_box로 추측했고, 명시된 근거가 없음
             regression_loss = torch.where(
