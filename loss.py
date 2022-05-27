@@ -1,89 +1,93 @@
 import torch
 import torch.nn as nn
+import math
+
+#   0    0    0    1   0000000
+# [00] [00] [00] [01] ...
+
+# beat     0 1 0 1 0 1 0 1 0 1
+# downbeat 0 1 0 0 0 0 0 0 0 1
 
 class FocalLoss(nn.Module):
-    #def __init__(self):
+    def __init__(self, sr, target_factor):
+        super(FocalLoss, self).__init__()
+
+        self.sr = sr
+        self.target_factor = target_factor
 
     def forward(self, classifications, regressions, annotations):
-        alpha = 0.25
-        gamma = 2.0
+        alpha = 0.25 # tried: 0.5, 0.01
+        gamma = 5 #original 2.0, tried: 1, 5
         batch_size = classifications.shape[0]
         classification_losses = []
         regression_losses = []
+        beat_times = annotations[:, 2, :]
+        print(annotations[:, 2, :].max())
 
         for j in range(batch_size):
             classification = classifications[j, :, :]
             regression = regressions[j, :, :]
+            print("regression", regression.shape)
 
+            # [ [0, 1, 0, 0, 1, ...], [0, 1, 0, 0, 0, ...] ] (beat, downbeat)
             bline_annotation = annotations[j, :, :]
-            bline_annotation = bline_annotation[bline_annotation[:, 2] != -1] # -1은 padding value
             classification = torch.clamp(classification, 1e-4, 1.0 - 1e-4)
 
-            beat_lines = bline_annotation[:, :]
-            beat_timepoints = (beat_lines[:, 0] + beat_lines[:, 1])/2
-            positive_indices = torch.floor(beat_timepoints*100).long()
-            
-            anchor_beats_start = positive_indices/100
+            beat_indices = torch.nonzero(bline_annotation[0] == 1, as_tuple=False) # [ 3, 16, 20, ... ]
+            is_downbeat = bline_annotation[1, beat_indices] == 1 # [ True, False, False, False, True, ... ]
+
+            positive_indices = annotations[j, 0, :]
+            num_positive_anchors = positive_indices.sum()
+
+            if num_positive_anchors == 0:
+                continue
 
             ##########################
             # compute the loss for classification
             # 1280, 2
-            targets = torch.zeros(classification.shape)
+
+            # 01 beat
+            # 10 downbeat
+            classification_labels = torch.zeros(classification.shape).to(classification.device)
+            for idx, beat_index in enumerate(beat_indices):
+                if is_downbeat[idx]:
+                    classification_labels[beat_index, 0] = 1
+                else:
+                    classification_labels[beat_index, 1] = 1
 
             if torch.cuda.is_available():
-                targets = targets.cuda()
-
-            num_positive_anchors = len(positive_indices)
-
-            targets[positive_indices, beat_lines[:, 2].long()] = 1
-
-            if torch.cuda.is_available():
-                alpha_factor = (torch.ones(targets.shape) * alpha).cuda()
+                alpha_factor = (torch.ones(classification.shape) * alpha).cuda()
             else:
-                alpha_factor = torch.ones(targets.shape) * alpha
+                alpha_factor = torch.ones(classification.shape) * alpha
 
-            alpha_factor = torch.where(torch.eq(targets, 1.), alpha_factor, 1. - alpha_factor)
-            focal_weight = torch.where(torch.eq(targets, 1.), 1. - classification, classification)
+            alpha_factor = torch.where(torch.eq(classification_labels, 1.), alpha_factor, 1. - alpha_factor)
+            focal_weight = torch.where(torch.eq(classification_labels, 1.), 1. - classification, classification)
             focal_weight = alpha_factor * torch.pow(focal_weight, gamma)
 
-            bce = -(targets * torch.log(classification) + (1.0 - targets) * torch.log(1.0 - classification))
+            if -(classification_labels * torch.log(classification)).sum() < 0.001 or -((1.0 - classification_labels) * torch.log(1.0 - classification)).sum() < 0.001:
+                print("경고: BCE의 어느 한 쪽은 0.001 미만")
 
-            # cls_loss = focal_weight * torch.pow(bce, gamma)
+            bce = -(classification_labels * torch.log(classification) + (1.0 - classification_labels) * torch.log(1.0 - classification))
+
             cls_loss = focal_weight * bce
-
             classification_losses.append(cls_loss.sum()/num_positive_anchors)
 
             ##########################
             # compute the loss for regression
 
-            anchor_widths_pi = 0.01 # anchor_beats_end - anchor_beats_start
-            anchor_ctr_x_pi = anchor_beats_start + 0.005 # anchor_beats_start + 0.5*anchor_widths_pi
+            regression_labels = beat_times[j, :].clone().detach().to(regression.device)
+            print("reg", regression_labels[regression_labels.nonzero()].squeeze())
+            regression_labels /= classifications.shape[1] * self.target_factor / self.sr
+            print("reg", regression_labels[regression_labels.nonzero()].squeeze())
+            regression_labels_left = regression_labels[:]
+            regression_labels_right = regression_labels[:]
 
-            gt_widths  = 0.01 # beat_lines[:, 1] - beat_lines[:, 0]
-            gt_ctr_x   = beat_lines[:, 0] + 0.005 # beat_lines[:, 0] + 0.5*gt_widths
-            # gt_start = beat_lines[:, 0]
-            # gt_end = beat_lines[:, 1]
+            regression_diff_left = torch.pow(regression_labels_left[positive_indices.bool()].long() - regression[positive_indices.bool(), 0], 2).float()
+            regression_diff_right = torch.pow(regression_labels_right[positive_indices.bool()].long() - regression[positive_indices.bool(), 1], 2).float()
+            regression_diff = (regression_diff_left + regression_diff_right)/2
 
-            # clip widths to 1
-            #gt_widths  = torch.clamp(gt_widths, min=0.01)
+            regression_loss = regression_diff
 
-            targets_dx = ((gt_ctr_x - anchor_ctr_x_pi) / anchor_widths_pi).cuda()
-            # targets_dw = torch.log(gt_widths / anchor_widths_pi)
-            # targets_distance_start = anchor_beats_start - gt_start
-            # targets_distance_end = anchor_beats_end - gt_end
-
-            # targets = torch.stack((targets_distance_start, targets_distance_end))
-            # targets = targets.t()
-
-            targets_dx = targets_dx.unsqueeze(1)
-            regression_diff = torch.abs(targets_dx - regression[positive_indices, :])
-
-            # 9.0 삭제됨. num_box로 추측했고, 명시된 근거가 없음
-            regression_loss = torch.where(
-                torch.le(regression_diff, 1.0),
-                0.5 * torch.pow(regression_diff, 2),
-                regression_diff - 0.5
-            )
             regression_losses.append(regression_loss.mean())
 
         return torch.stack(classification_losses).mean(dim=0, keepdim=True), torch.stack(regression_losses).mean(dim=0, keepdim=True)
