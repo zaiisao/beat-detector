@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 
 class ClassificationModel(nn.Module):
@@ -47,7 +48,7 @@ class ClassificationModel(nn.Module):
         return out2.contiguous().view(x.shape[0], -1, self.num_classes)
 
 class RegressionModel(nn.Module):
-    def __init__(self, num_features_in, num_anchors=2, feature_size=256):
+    def __init__(self, num_features_in, num_anchors=1, feature_size=256):
         super(RegressionModel, self).__init__()
 
         self.conv1 = nn.Conv1d(num_features_in, feature_size, kernel_size=3, padding=1)
@@ -81,4 +82,4 @@ class RegressionModel(nn.Module):
 
         out = out.permute(0, 2, 1)
 
-        return out.contiguous().view(out.shape[0], -1, 2)
+        return out.contiguous().view(out.shape[0], -1, 1)
